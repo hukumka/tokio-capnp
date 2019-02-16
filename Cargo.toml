@@ -1,0 +1,13 @@
+[package]
+name = "tokio-capnp"
+version = "0.1.0"
+authors = ["hukumka <hukumka212@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+capnp = "0.9"
+tokio = "0.1"
+bytes = "0.4"
+futures = "0.1"
+smallvec = "0.6"
+log = "0.4"
