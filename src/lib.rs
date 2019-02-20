@@ -313,6 +313,7 @@ impl<'a> TableAndSegment<'a> {
         Ok(TableAndSegment::Vec(res))
     }
 
+    #[inline]
     fn combine_slices<'b>(a: &'b [Word], b: &'b [Word]) -> Option<&'a [Word]> {
         if Self::can_combine_slices(a, b) {
             Some(unsafe { std::slice::from_raw_parts(a.as_ptr(), a.len() + b.len()) })
@@ -321,6 +322,7 @@ impl<'a> TableAndSegment<'a> {
         }
     }
 
+    #[inline]
     fn can_combine_slices<'b>(a: &'b [Word], b: &'b [Word]) -> bool {
         a[a.len()..].as_ptr() == b.as_ptr()
     }
