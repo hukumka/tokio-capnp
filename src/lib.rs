@@ -2,29 +2,36 @@
 extern crate log;
 
 use bytes::{ByteOrder, LittleEndian};
-use capnp::message::{ReaderSegments, Reader, ReaderOptions};
+use capnp::message::{Reader, ReaderOptions, ReaderSegments};
 use capnp::{Error as CapnpError, Word};
 use futures::try_ready;
 use std::ops::Range;
 use tokio::io::AsyncWrite;
 use tokio::prelude::*;
 
-pub fn read_message<S: AsyncRead>(stream: S) -> MessageRead<S> {
+/// Asynchronously read capnproto message from stream
+///
+/// Returns future, which evaluates into `capnp::message::Reader`
+pub fn read_message<S: AsyncRead>(stream: S, options: ReaderOptions) -> MessageRead<S> {
     MessageRead {
         stream,
+        options,
         owned_space: None,
         state: ReadState::new(),
         table: vec![Word { raw_content: 0 }],
     }
 }
 
+/// Future of reading message from stream
 pub struct MessageRead<S> {
     stream: S,
+    options: ReaderOptions,
     owned_space: Option<OwnedSpace>,
     state: ReadState,
     table: Vec<Word>,
 }
 
+/// Space allocated for message
 pub struct OwnedSpace {
     slices: Vec<Range<usize>>,
     space: Vec<Word>,
@@ -56,11 +63,11 @@ impl ReadState {
     }
 }
 
-fn poll_read_helper<S: AsyncRead>(stream: &mut S, buf: &mut [u8]) -> Poll<usize, CapnpError>{
+fn poll_read_helper<S: AsyncRead>(stream: &mut S, buf: &mut [u8]) -> Poll<usize, CapnpError> {
     let res = try_ready!(stream.poll_read(buf));
-    if res == 0{
+    if res == 0 {
         Err(CapnpError::disconnected("Early EOF".to_string()))
-    }else{
+    } else {
         Ok(Async::Ready(res))
     }
 }
@@ -75,7 +82,10 @@ impl<S: AsyncRead> Future for MessageRead<S> {
             match self.state {
                 ReadState::SegmentTableHeader(ref mut read) => {
                     let buf = Word::words_to_bytes_mut(&mut self.table[0..1]);
-                    *read += try_ready!(poll_read_helper(&mut self.stream, &mut buf[*read..WORD_SIZE]));
+                    *read += try_ready!(poll_read_helper(
+                        &mut self.stream,
+                        &mut buf[*read..WORD_SIZE]
+                    ));
                     if *read >= WORD_SIZE {
                         // prepare buffer for whole segment table
                         let segment_count = LittleEndian::read_u32(&buf[0..4]) + 1;
@@ -93,7 +103,10 @@ impl<S: AsyncRead> Future for MessageRead<S> {
                     total_bytes,
                 } => {
                     let buf = Word::words_to_bytes_mut(&mut self.table);
-                    *read += try_ready!(poll_read_helper(&mut self.stream, &mut buf[*read..WORD_SIZE]));
+                    *read += try_ready!(poll_read_helper(
+                        &mut self.stream,
+                        &mut buf[*read..WORD_SIZE]
+                    ));
                     if *read >= total_bytes {
                         self.owned_space = Some(OwnedSpace::from_segment_table(&self.table));
                         self.state = ReadState::Segments {
@@ -108,14 +121,17 @@ impl<S: AsyncRead> Future for MessageRead<S> {
                 } => {
                     let buf =
                         Word::words_to_bytes_mut(&mut self.owned_space.as_mut().unwrap().space);
-                    *read += try_ready!(poll_read_helper(&mut self.stream, &mut buf[*read..total_bytes]));
+                    *read += try_ready!(poll_read_helper(
+                        &mut self.stream,
+                        &mut buf[*read..total_bytes]
+                    ));
                     if *read >= total_bytes {
                         break;
                     }
                 }
             }
         }
-        let res = Reader::new(self.owned_space.take().unwrap(), ReaderOptions::default());
+        let res = Reader::new(self.owned_space.take().unwrap(), self.options);
         Ok(Async::Ready(res))
     }
 }
@@ -131,34 +147,60 @@ impl OwnedSpace {
             slices.push(total_size..total_size + segment_size);
             total_size += segment_size;
         }
-        let space: Vec<Word> = vec![Word{raw_content: 0}; total_size];
+        let space: Vec<Word> = vec![Word { raw_content: 0 }; total_size];
         OwnedSpace { slices, space }
     }
 }
 
 /// Write message into stream
-pub fn write_message<S: AsyncWrite, T: ReaderSegments>(
+pub fn write_message<'a, S: AsyncWrite, M: WritableMessage<'a>>(
     stream: S,
-    message: T,
-) -> MessageWrite<S, T> {
-    MessageWrite {
+    message: M,
+) -> Result<MessageWrite<'a, S, M::Item>, CapnpError> {
+    let (table, message) = message.split();
+    let table_and_segment = TableAndSegment::new(&message, table)?;
+    Ok(MessageWrite {
         message,
         stream,
         state: WriteState::new(),
-        table_and_segment: None,
+        table_and_segment,
+    })
+}
+
+pub trait WritableMessage<'a> {
+    type Item: ReaderSegments;
+    fn split(self) -> (Option<&'a mut [Word]>, Self::Item);
+}
+
+impl<'a, T: ReaderSegments + 'a> WritableMessage<'a> for T {
+    type Item = T;
+    fn split(self) -> (Option<&'a mut [Word]>, T) {
+        (None, self)
     }
 }
 
-pub struct MessageWrite<S, T> {
+pub struct TableAndMessage<'a, T> {
+    pub message: T,
+    pub table: &'a mut [Word],
+}
+
+impl<'a, T: ReaderSegments> WritableMessage<'a> for TableAndMessage<'a, T> {
+    type Item = T;
+    fn split(self) -> (Option<&'a mut [Word]>, T) {
+        (Some(self.table), self.message)
+    }
+}
+
+pub struct MessageWrite<'a, S, M> {
     /// Stream into which we write our message
     stream: S,
     /// Our message
-    message: T,
+    message: M,
     /// Current segment to write. For segment 0 we want to write both segment table
     /// and segment
     state: WriteState,
     /// Here we hold combined segment table and first segment
-    table_and_segment: Option<Vec<Word>>,
+    table_and_segment: TableAndSegment<'a>,
 }
 
 /// State of async write operation
@@ -178,30 +220,37 @@ impl WriteState {
     }
 }
 
-impl<S, T> Future for MessageWrite<S, T>
+enum TableAndSegment<'a> {
+    Slice(&'a [Word]),
+    Vec(Vec<Word>),
+}
+
+impl<'a> AsRef<[Word]> for TableAndSegment<'a> {
+    fn as_ref(&self) -> &[Word] {
+        match self {
+            TableAndSegment::Slice(s) => s,
+            TableAndSegment::Vec(v) => v.as_slice(),
+        }
+    }
+}
+
+impl<'a, S, M> Future for MessageWrite<'a, S, M>
 where
     S: AsyncWrite,
-    T: ReaderSegments,
+    M: ReaderSegments,
 {
     type Item = ();
     type Error = CapnpError;
 
     fn poll(&mut self) -> Poll<(), CapnpError> {
         if self.state.segment_id == 0 {
-            if self.table_and_segment.is_none() {
-                self.table_and_segment = Some(build_table_and_segment(&self.message)?);
-            }
-            if let Some(ref table_and_segment) = self.table_and_segment {
-                let buffer = Word::words_to_bytes(table_and_segment);
-                info!("Write: {:?}", buffer);
-                try_ready!(poll_write_state_buffer(
-                    &mut self.stream,
-                    &mut self.state,
-                    buffer
-                ));
-            } else {
-                unreachable!();
-            }
+            let buffer = Word::words_to_bytes(self.table_and_segment.as_ref());
+            info!("Write: {:?}", buffer);
+            try_ready!(poll_write_state_buffer(
+                &mut self.stream,
+                &mut self.state,
+                buffer
+            ));
         }
         while self.state.segment_id < self.message.len() {
             let segment = self
@@ -233,17 +282,48 @@ fn poll_write_state_buffer<S: AsyncWrite>(
     Ok(Async::Ready(()))
 }
 
-/// Build Vec containing both segment table and first segment in continious
-/// memory.
-fn build_table_and_segment<T: ReaderSegments>(message: &T) -> Result<Vec<Word>, CapnpError> {
-    let segment = message.get_segment(0).ok_or_else(|| {
-        CapnpError::failed("Message must contain at least 1 segment.".to_string())
-    })?;
-    let table_size = table_size_in_words(message.len());
-    let mut res = Word::allocate_zeroed_vec(table_size + segment.len());
-    write_table(message, &mut res[0..table_size])?;
-    (&mut res[table_size..]).copy_from_slice(segment);
-    Ok(res)
+impl<'a> TableAndSegment<'a> {
+    /// Build Vec containing both segment table and first segment in continious
+    /// memory.
+    fn new<T: ReaderSegments>(
+        message: &T,
+        table_space: Option<&'a mut [Word]>,
+    ) -> Result<Self, CapnpError> {
+        let segment = message.get_segment(0).ok_or_else(|| {
+            CapnpError::failed("Message must contain at least 1 segment.".to_string())
+        })?;
+        let table_size = table_size_in_words(message.len());
+        // Trick to save copy and allocation by having table_space and
+        // first segment adjusted in same allocation. Then we
+        // concatenate those slices instead of copying table and
+        // first segment into same Vec
+        if let Some(table) = table_space{
+            if table.len() >= table_size && Self::can_combine_slices(table, segment){
+                // write into the end of table
+                let start = table.len() - table_size;
+                write_table(message, &mut table[start..])?;
+                let slice = Self::combine_slices(&table[start..], segment).unwrap();
+                return Ok(TableAndSegment::Slice(slice));
+            }
+        }
+
+        let mut res = Word::allocate_zeroed_vec(table_size + segment.len());
+        write_table(message, &mut res[0..table_size])?;
+        (&mut res[table_size..]).copy_from_slice(segment);
+        Ok(TableAndSegment::Vec(res))
+    }
+
+    fn combine_slices<'b>(a: &'b [Word], b: &'b [Word]) -> Option<&'a [Word]> {
+        if Self::can_combine_slices(a, b) {
+            Some(unsafe { std::slice::from_raw_parts(a.as_ptr(), a.len() + b.len()) })
+        } else {
+            None
+        }
+    }
+
+    fn can_combine_slices<'b>(a: &'b [Word], b: &'b [Word]) -> bool {
+        a[a.len()..].as_ptr() == b.as_ptr()
+    }
 }
 
 #[inline]

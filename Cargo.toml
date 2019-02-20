@@ -6,8 +6,21 @@ edition = "2018"
 
 [dependencies]
 capnp = "0.9"
-tokio = "0.1"
+tokio = {version="0.1", features=["async-await-preview"]}
 bytes = "0.4"
 futures = "0.1"
 smallvec = "0.6"
 log = "0.4"
+
+[build-dependencies]
+capnpc = "0.9"
+
+[dev-dependencies]
+criterion = "0.2"
+capnp-futures = "0.9"
+
+
+[[bench]]
+name = "tcp"
+build = "bench/build.rs"
+harness = false
